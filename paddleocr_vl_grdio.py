@@ -10,6 +10,7 @@ import requests
 from pathlib import Path
 from urllib.parse import urlparse
 import os
+import re
 
 # 在导入后立即设置环境变量，避免Gradio初始化时的网络请求
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
@@ -136,6 +137,117 @@ def initialize_model(ov_model_path="./ov_paddleocr_vl_model",
     except Exception as e:
         return f"❌ 模型初始化失败: {str(e)}"
 
+def format_ocr_result(text):
+    """
+    格式化OCR识别结果，处理特殊标记
+    支持格式：
+    - <fcel> 表格单元格标记（格式：<fcel>内容<fcel>）
+    - <nl> 换行标记
+    
+    注意：格式是 <fcel>内容<fcel>，即开始和结束都是 <fcel>
+    只有检测到表格格式时才转换为Markdown表格，否则只清理标记
+    """
+    if not text:
+        return text
+    
+    # 先替换换行标记
+    text = text.replace('<nl>', '\n')
+    
+    # 检测是否是表格格式（包含多个<fcel>标记）
+    # 需要检查是否有多个<fcel>标记，且至少有一行包含多个单元格
+    is_table_format = False
+    if '<fcel>' in text:
+        # 检查是否有多行包含<fcel>标记，或者单行包含多个<fcel>标记
+        lines_with_fcel = [line for line in text.split('\n') if '<fcel>' in line]
+        if len(lines_with_fcel) > 0:
+            # 检查第一行是否有多个<fcel>标记（至少2个，表示有多个单元格）
+            first_line_fcel_count = lines_with_fcel[0].count('<fcel>')
+            if first_line_fcel_count >= 2:
+                is_table_format = True
+    
+    if is_table_format:
+        # 按行分割
+        lines = text.split('\n')
+        table_rows = []
+        
+        for line in lines:
+            if '<fcel>' in line:
+                # 使用正则表达式提取所有 <fcel>内容<fcel> 格式的单元格
+                # 格式是 <fcel>内容<fcel>，所以需要匹配 <fcel> 到下一个 <fcel> 之间的内容
+                # 使用非贪婪匹配，但需要确保匹配所有单元格
+                
+                # 方法：找到所有 <fcel> 标记的位置，然后提取每对之间的内容
+                fcel_positions = [m.start() for m in re.finditer(r'<fcel>', line)]
+                
+                if len(fcel_positions) >= 2:
+                    row_cells = []
+                    # 每两个连续的 <fcel> 之间是一个单元格
+                    for i in range(0, len(fcel_positions) - 1):
+                        start_pos = fcel_positions[i] + len('<fcel>')
+                        end_pos = fcel_positions[i + 1]
+                        cell_content = line[start_pos:end_pos].strip()
+                        row_cells.append(cell_content)
+                    
+                    # 如果最后一个 <fcel> 后面还有内容（没有结束的 <fcel>），也提取
+                    if len(fcel_positions) > 0:
+                        last_fcel_pos = fcel_positions[-1] + len('<fcel>')
+                        # 检查最后一个 <fcel> 后面是否还有内容（不是换行符或结束）
+                        remaining = line[last_fcel_pos:].strip()
+                        # 移除可能的 <nl> 标记
+                        remaining = remaining.replace('<nl>', '').strip()
+                        if remaining:
+                            row_cells.append(remaining)
+                    
+                    if row_cells:
+                        table_rows.append(row_cells)
+        
+        if table_rows and len(table_rows) > 0:
+            # 找到最大列数（用于对齐）
+            max_cols = max(len(row) for row in table_rows)
+            
+            # 转换为Markdown表格
+            md_table = ""
+            
+            # 创建表头（第一行）
+            if len(table_rows) > 0:
+                header = table_rows[0].copy()
+                # 补齐列数
+                while len(header) < max_cols:
+                    header.append("")
+                md_table += "| " + " | ".join(header) + " |\n"
+                md_table += "| " + " | ".join(["---"] * max_cols) + " |\n"
+                
+                # 添加数据行
+                for row in table_rows[1:]:
+                    row_copy = row.copy()
+                    # 确保行长度与最大列数一致
+                    while len(row_copy) < max_cols:
+                        row_copy.append("")
+                    md_table += "| " + " | ".join(row_copy[:max_cols]) + " |\n"
+            
+            return md_table
+    
+    # 如果不是表格格式，只清理标记，保持原始文本格式
+    # 移除<fcel>标记，但保留其他内容和换行
+    text = text.replace('<fcel>', '')
+    text = text.replace('</fcel>', '')
+    # <nl>已经在开头替换为\n了，这里不需要再处理
+    
+    # 清理多余的空行（保留合理的空行）
+    lines = text.split('\n')
+    cleaned_lines = []
+    prev_empty = False
+    for line in lines:
+        line = line.strip()
+        if line:
+            cleaned_lines.append(line)
+            prev_empty = False
+        elif not prev_empty:
+            cleaned_lines.append('')
+            prev_empty = True
+    
+    return '\n'.join(cleaned_lines)
+
 def load_image_from_source(image_source):
     """从不同来源加载图片：PIL Image对象、本地路径或URL"""
     if image_source is None:
@@ -176,7 +288,7 @@ def process_ocr(image, image_url_or_path, task_type, max_new_tokens, custom_prom
     global paddleocr_vl_model, my_preprocessor
     
     if paddleocr_vl_model is None or my_preprocessor is None:
-        return "❌ 请先初始化模型！", None
+        return "❌ 请先初始化模型！", None, None
     
     # 确定使用哪个图片源
     image_source = None
@@ -186,13 +298,13 @@ def process_ocr(image, image_url_or_path, task_type, max_new_tokens, custom_prom
         image_source = image_url_or_path.strip()
     
     if image_source is None:
-        return "❌ 请上传图片、输入图片路径或URL！", None
+        return "❌ 请上传图片、输入图片路径或URL！", None, None
     
     try:
         # 加载图片（支持PIL Image、本地路径或URL）
         loaded_image = load_image_from_source(image_source)
         if loaded_image is None:
-            return "❌ 无法加载图片！", None
+            return "❌ 无法加载图片！", None, None
         
         # 准备提示词
         if custom_prompt and custom_prompt.strip():
@@ -273,27 +385,60 @@ def process_ocr(image, image_url_or_path, task_type, max_new_tokens, custom_prom
         )
         elapsed_time = time.perf_counter() - start_time
         
-        # 格式化结果
+        # 格式化结果（处理特殊标记）
+        formatted_response = format_ocr_result(response)
+        
+        # 判断是否是表格格式（包含Markdown表格）
+        is_table = formatted_response.strip().startswith('|') and '---' in formatted_response
+        
+ # 格式化结果文本
         result_text = f"""📄 OCR识别结果:
-{response}
+{formatted_response}
 
 ⏱️ 执行时间: {elapsed_time:.3f} 秒 ({elapsed_time*1000:.2f} 毫秒)
 """
         
-        return result_text, response
+        # 准备Markdown可视化内容
+        if is_table:
+            # 只有表格才转换为Markdown并可视化
+            markdown_content = f"""## 📊 表格可视化
+
+{formatted_response}
+
+---
+*执行时间: {elapsed_time:.3f} 秒*
+"""
+        else:
+            # 非表格情况，直接显示原始文本（不进行Markdown格式化）
+            markdown_content = f"""## 📄 识别结果
+
+{response}
+
+---
+*执行时间: {elapsed_time:.3f} 秒*
+"""
+        
+        # 返回：格式化文本、原始结果、Markdown可视化
+        return result_text, response, markdown_content
         
     except Exception as e:
         import traceback
         error_detail = traceback.format_exc()
-        return f"❌ 识别失败: {str(e)}\n\n详细信息:\n{error_detail}", None
+        return f"❌ 识别失败: {str(e)}\n\n详细信息:\n{error_detail}", None, None
 
 # 创建Gradio界面
-with gr.Blocks(title="PaddleOCR-VL OCR识别系统", theme=gr.themes.Soft()) as demo:
+# 添加异常处理配置，避免响应内容长度错误
+with gr.Blocks(
+    title="PaddleOCR-VL OCR识别系统 v2", 
+    theme=gr.themes.Soft(),
+    # 添加这些配置来避免响应问题
+    analytics_enabled=False,
+) as demo:
     gr.Markdown(
         """
-        # 🚀 PaddleOCR-VL OCR识别系统
+        # 🚀 PaddleOCR-VL OCR识别系统 v2
         
-        基于OpenVINO的PaddleOCR-VL模型OCR识别界面
+        基于OpenVINO的PaddleOCR-VL模型OCR识别界面（使用render_jinja_template）
         
         ## 使用说明
         1. 首先在"模型设置"中初始化模型
@@ -339,7 +484,7 @@ with gr.Blocks(title="PaddleOCR-VL OCR识别系统", theme=gr.themes.Soft()) as 
                 image_input = gr.Image(
                     label="上传图片（方式1：直接上传）",
                     type="pil",
-                    sources=["upload", "clipboard"]
+                    sources=["upload", "clipboard"],
                 )
                 image_url_or_path = gr.Textbox(
                     label="图片路径或URL（方式2：输入本地路径或网络URL）",
@@ -369,16 +514,21 @@ with gr.Blocks(title="PaddleOCR-VL OCR识别系统", theme=gr.themes.Soft()) as 
                 recognize_btn = gr.Button("开始识别", variant="primary", size="lg")
             
             with gr.Column():
+                markdown_output = gr.Markdown(
+                    label="Markdown可视化（表格渲染）",
+                    value="等待识别结果...",
+                )
                 result_output = gr.Textbox(
-                    label="识别结果",
-                    lines=20,
+                    label="识别结果（格式化后文本）",
+                    lines=15,
                     interactive=False
                 )
                 raw_result = gr.Textbox(
-                    label="原始结果（仅文本）",
-                    lines=5,
+                    label="原始结果（未格式化）",
+                    lines=8,
                     interactive=True
                 )
+                gr.Markdown("**提示**: 格式化结果会自动将表格标记转换为Markdown表格格式，并在上方可视化显示")
     
     with gr.Tab("使用说明"):
         gr.Markdown(
@@ -428,18 +578,20 @@ with gr.Blocks(title="PaddleOCR-VL OCR识别系统", theme=gr.themes.Soft()) as 
     recognize_btn.click(
         fn=process_ocr,
         inputs=[image_input, image_url_or_path, task_type, max_tokens, custom_prompt],
-        outputs=[result_output, raw_result]
+        outputs=[result_output, raw_result, markdown_output]
     )
 
 if __name__ == "__main__":
     import os
     import socket
     
+    # 彻底禁用Gradio的网络检查，避免连接超时和403错误
     os.environ["GRADIO_SERVER_NAME"] = "127.0.0.1"
     os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
     os.environ["GRADIO_SERVER_PROXY"] = ""
     os.environ["NO_PROXY"] = "127.0.0.1,localhost"
     os.environ["no_proxy"] = "127.0.0.1,localhost"
+    # 禁用启动事件检查
     os.environ["GRADIO_SKIP_STARTUP_EVENTS"] = "1"
     
     def find_free_port(start_port=7860, max_attempts=10):
@@ -456,7 +608,7 @@ if __name__ == "__main__":
     
     try:
         print("=" * 60)
-        print("正在启动PaddleOCR-VL OCR识别系统...")
+        print("正在启动PaddleOCR-VL OCR识别系统 v2...")
         print("=" * 60)
         
         # 查找可用端口
@@ -481,7 +633,11 @@ if __name__ == "__main__":
                     quiet=False,               # 显示启动信息
                     favicon_path=None,         # 不使用favicon
                     prevent_thread_lock=False,   # 允许在后台运行
+                    # 添加这些参数来避免启动事件检查和响应问题
                     max_threads=1,             # 限制线程数
+                    # 修复响应内容长度问题
+                    max_file_size=None,        # 不限制文件大小（或设置一个较大的值）
+                    allowed_paths=None,        # 允许所有路径
                 )
                 break  # 成功启动
             except Exception as e:
