@@ -17,6 +17,9 @@ import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
 import io
 import base64
+import multiprocessing
+from multiprocessing import Process, Queue, Manager
+import threading
 
 # 在导入后立即设置环境变量，避免Gradio初始化时的网络请求
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
@@ -27,6 +30,10 @@ os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
 # 全局变量
 paddleocr_vl_model = None
 my_preprocessor = None
+init_process = None  # 初始化进程对象
+init_process_pid = None  # 初始化进程ID
+init_status_queue = None  # 用于进程间通信的队列
+init_params = None  # 保存初始化参数
 
 # 任务提示词
 PROMPTS = {
@@ -96,52 +103,512 @@ def load_chat_template(template_path=None):
             return f"❌ 加载模板失败: {str(e)}，使用默认模板"
     return "使用默认模板"
 
+def _initialize_model_process(
+    ov_model_path,
+    device_type,
+    llm_int4_compress,
+    vision_int8_quant,
+    llm_int8_quant,
+    template_path,
+    status_queue,
+    result_queue
+):
+    """
+    在独立进程中验证模型可以加载
+    注意：由于模型对象无法在进程间共享，此函数主要用于验证模型文件
+    实际模型对象需要在主进程中初始化
+    """
+    import os
+    process_id = os.getpid()
+    
+    try:
+        status_queue.put(f"🔄 进程 {process_id} 开始验证模型...")
+        
+        # 验证模型文件是否存在
+        model_path = Path(ov_model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"模型路径不存在: {ov_model_path}")
+        
+        status_queue.put(f"✅ 模型路径验证通过: {ov_model_path}")
+        
+        # 验证模型文件
+        if llm_int4_compress:
+            llm_model_file = model_path / "llm_stateful_int4.xml"
+        else:
+            llm_model_file = model_path / "llm_stateful.xml"
+        
+        if not llm_model_file.exists():
+            raise FileNotFoundError(f"LLM模型文件不存在: {llm_model_file}")
+        
+        status_queue.put(f"✅ LLM模型文件验证通过")
+        
+        # 验证vision模型文件
+        if vision_int8_quant:
+            vision_model_file = model_path / "vision_int8.xml"
+        else:
+            vision_model_file = model_path / "vision.xml"
+        
+        if not vision_model_file.exists():
+            raise FileNotFoundError(f"Vision模型文件不存在: {vision_model_file}")
+        
+        status_queue.put(f"✅ Vision模型文件验证通过")
+        
+        # 验证chat模板
+        if template_path:
+            try:
+                with open(template_path, 'r', encoding='utf-8') as f:
+                    template_content = f.read()
+                status_queue.put(f"✅ Chat模板文件验证通过: {template_path}")
+            except Exception as e:
+                status_queue.put(f"⚠️ Chat模板文件验证失败: {str(e)}，将使用默认模板")
+        
+        # 尝试读取模型（验证模型文件完整性）
+        status_queue.put(f"🔄 正在验证模型文件完整性...")
+        core = ov.Core()
+        try:
+            core.read_model(str(llm_model_file))
+            status_queue.put(f"✅ 模型文件完整性验证通过")
+        except Exception as e:
+            raise Exception(f"模型文件读取失败: {str(e)}")
+        
+        # 返回成功结果
+        result_queue.put({
+            'success': True,
+            'message': f"✅ 模型验证成功！进程ID: {process_id}",
+            'process_id': process_id,
+            'ov_model_path': ov_model_path,
+            'device_type': device_type,
+            'llm_int4_compress': llm_int4_compress,
+            'vision_int8_quant': vision_int8_quant,
+            'llm_int8_quant': llm_int8_quant,
+            'template_path': template_path
+        })
+        status_queue.put(f"✅ 模型验证完成！进程ID: {process_id}")
+        
+    except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
+        result_queue.put({
+            'success': False,
+            'message': f"❌ 模型验证失败: {str(e)}",
+            'error': error_detail,
+            'process_id': process_id
+        })
+        status_queue.put(f"❌ 模型验证失败: {str(e)}")
+
 def initialize_model(ov_model_path="./ov_paddleocr_vl_model", 
                      device_type="GPU", 
                      llm_int4_compress=False, 
                      vision_int8_quant=False, 
                      llm_int8_quant=False,
                      template_path=None):
-    """初始化模型"""
-    global paddleocr_vl_model, my_preprocessor
+    """
+    初始化模型（在独立进程中验证，然后在主进程中初始化）
+    返回初始化状态和进程ID
+    """
+    global paddleocr_vl_model, my_preprocessor, init_process, init_process_pid, init_status_queue, init_params
+    
+    # 如果已有初始化进程在运行，先等待其完成或终止
+    if init_process is not None and init_process.is_alive():
+        status, pid = check_init_status()
+        return status, str(pid) if pid else "运行中"
     
     try:
-        # 加载chat模板
-        if template_path:
-            load_chat_template(template_path)
+        # 保存初始化参数
+        init_params = {
+            'ov_model_path': ov_model_path,
+            'device_type': device_type,
+            'llm_int4_compress': llm_int4_compress,
+            'vision_int8_quant': vision_int8_quant,
+            'llm_int8_quant': llm_int8_quant,
+            'template_path': template_path
+        }
         
-        # 初始化OpenVINO模型
-        core = ov.Core()
-        llm_infer_list = []
-        vision_infer = []
+        # 创建进程间通信的队列
+        status_queue = Queue()
+        result_queue = Queue()
         
-        paddleocr_vl_model = OVPaddleOCRVLForCausalLM(
-            core=core,
-            ov_model_path=ov_model_path,
-            device=device_type,
-            llm_int4_compress=llm_int4_compress,
-            vision_int8_quant=vision_int8_quant,
-            llm_int8_quant=llm_int8_quant,
-            llm_infer_list=llm_infer_list,
-            vision_infer=vision_infer
+        # 创建新进程来验证模型
+        init_process = Process(
+            target=_initialize_model_process,
+            args=(
+                ov_model_path,
+                device_type,
+                llm_int4_compress,
+                vision_int8_quant,
+                llm_int8_quant,
+                template_path,
+                status_queue,
+                result_queue
+            )
         )
         
-        # 初始化图像预处理器
-        my_preprocessor = PaddleOCRVLImageProcessor(
-            resample=3,  # PIL.Image.Resampling.LANCZOS
-            rescale_factor=0.00392156862745098,  # 1/255
-            image_mean=[0.5, 0.5, 0.5],
-            image_std=[0.5, 0.5, 0.5],
-            min_pixels=147384,
-            max_pixels=2822400,
-            patch_size=14,
-            temporal_patch_size=1,
-            merge_size=2
-        )
+        init_process.start()
+        init_process_pid = init_process.pid
+        init_status_queue = status_queue
         
-        return "✅ 模型初始化成功！"
+        # 启动一个线程来监控进程并在验证成功后初始化模型
+        def monitor_and_init():
+            global paddleocr_vl_model, my_preprocessor, init_process
+            if init_process is not None:
+                init_process.join()  # 等待进程完成
+                
+                # 获取验证结果
+                if not result_queue.empty():
+                    result = result_queue.get()
+                    if result['success']:
+                        # 在主进程中初始化模型对象
+                        try:
+                            # 加载chat模板
+                            if result['template_path']:
+                                load_chat_template(result['template_path'])
+                            
+                            # 初始化OpenVINO模型
+                            core = ov.Core()
+                            llm_infer_list = []
+                            vision_infer = []
+                            
+                            paddleocr_vl_model = OVPaddleOCRVLForCausalLM(
+                                core=core,
+                                ov_model_path=result['ov_model_path'],
+                                device=result['device_type'],
+                                llm_int4_compress=result['llm_int4_compress'],
+                                vision_int8_quant=result['vision_int8_quant'],
+                                llm_int8_quant=result['llm_int8_quant'],
+                                llm_infer_list=llm_infer_list,
+                                vision_infer=vision_infer
+                            )
+                            
+                            # 初始化图像预处理器
+                            my_preprocessor = PaddleOCRVLImageProcessor(
+                                resample=3,
+                                rescale_factor=0.00392156862745098,
+                                image_mean=[0.5, 0.5, 0.5],
+                                image_std=[0.5, 0.5, 0.5],
+                                min_pixels=147384,
+                                max_pixels=2822400,
+                                patch_size=14,
+                                temporal_patch_size=1,
+                                merge_size=2
+                            )
+                            
+                            status_queue.put(f"✅ 模型对象初始化完成！")
+                        except Exception as e:
+                            import traceback
+                            error_detail = traceback.format_exc()
+                            status_queue.put(f"❌ 模型对象初始化失败: {str(e)}\n{error_detail}")
+        
+        monitor_thread = threading.Thread(target=monitor_and_init, daemon=True)
+        monitor_thread.start()
+        
+        status_msg = f"🔄 模型初始化进程已启动，进程ID: {init_process_pid}\n正在后台验证模型，请稍候..."
+        return status_msg, str(init_process_pid)
+        
     except Exception as e:
-        return f"❌ 模型初始化失败: {str(e)}"
+        return f"❌ 启动初始化进程失败: {str(e)}", "错误"
+
+def safe_encode_text(text):
+    """
+    安全编码文本，确保UTF-8编码正确，避免Content-Length错误
+    """
+    if text is None:
+        return ""
+    try:
+        # 确保是字符串类型
+        if not isinstance(text, str):
+            text = str(text)
+        # 编码为UTF-8，处理任何编码错误
+        text = text.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+        # 限制长度，避免响应过大
+        max_length = 5000  # 限制最大长度为5000字符
+        if len(text) > max_length:
+            text = text[:max_length] + "\n...(内容已截断)"
+        return text
+    except Exception as e:
+        # 如果编码失败，返回安全的错误消息
+        return f"状态信息编码错误: {str(e)}"
+
+# 用于缓存上次状态，避免重复创建相同内容
+_last_status_cache = {"text": "", "pid": "", "timestamp": 0}
+
+def check_init_status():
+    """
+    检查初始化进程的状态
+    返回当前状态信息和进程ID
+    优化：使用缓存避免重复创建相同内容，减少内存占用
+    """
+    global init_process, init_process_pid, init_status_queue, _last_status_cache
+    
+    try:
+        # 如果没有进程，返回缓存的状态（避免频繁创建新字符串）
+        if init_process is None:
+            cache_key = "waiting"
+            if _last_status_cache.get("key") != cache_key:
+                _last_status_cache = {
+                    "key": cache_key,
+                    "text": safe_encode_text("等待初始化..."),
+                    "pid": "未启动",
+                    "timestamp": time.time()
+                }
+            return _last_status_cache["text"], _last_status_cache["pid"]
+        
+        if init_status_queue is None:
+            cache_key = f"started_{init_process_pid}"
+            if _last_status_cache.get("key") != cache_key:
+                status_msg = f"进程 {init_process_pid} 已启动，等待状态更新..."
+                _last_status_cache = {
+                    "key": cache_key,
+                    "text": safe_encode_text(status_msg),
+                    "pid": str(init_process_pid) if init_process_pid else "未启动",
+                    "timestamp": time.time()
+                }
+            return _last_status_cache["text"], _last_status_cache["pid"]
+        
+        # 收集状态消息（限制数量，避免队列阻塞和内存累积）
+        status_messages = []
+        max_messages = 10  # 减少到10条消息，降低内存占用
+        message_count = 0
+        
+        # 限制读取时间，避免阻塞
+        start_time = time.time()
+        timeout = 0.1  # 100ms超时
+        
+        # 先读取所有消息，然后只保留最新的（避免队列累积）
+        all_messages = []
+        try:
+            while not init_status_queue.empty():
+                try:
+                    msg = init_status_queue.get_nowait()
+                    if msg:
+                        all_messages.append(str(msg))
+                except Exception:
+                    break
+        except Exception:
+            pass
+        
+        # 只保留最新的消息，丢弃旧的（防止内存累积）
+        if len(all_messages) > max_messages:
+            all_messages = all_messages[-max_messages:]
+        
+        # 处理消息，限制长度
+        for msg in all_messages:
+            if len(msg) > 200:  # 限制单条消息最大200字符
+                msg = msg[:200] + "..."
+            status_messages.append(msg)
+            message_count += 1
+        
+        # 检查进程是否还在运行
+        try:
+            is_alive = init_process.is_alive() if init_process is not None else False
+        except Exception:
+            is_alive = False
+        
+        # 生成状态文本
+        if status_messages:
+            status_text = "\n".join(status_messages)
+            if not is_alive:
+                status_text += f"\n✅ 进程 {init_process_pid} 已完成"
+        else:
+            if is_alive:
+                status_text = f"🔄 进程 {init_process_pid} 正在运行中..."
+            else:
+                status_text = f"✅ 进程 {init_process_pid} 已完成"
+        
+        # 使用缓存避免重复创建相同内容
+        cache_key = f"{hash(status_text)}_{init_process_pid}_{is_alive}"
+        if _last_status_cache.get("key") != cache_key:
+            _last_status_cache = {
+                "key": cache_key,
+                "text": safe_encode_text(status_text),
+                "pid": str(init_process_pid) if init_process_pid else "未启动",
+                "timestamp": time.time()
+            }
+        
+        return _last_status_cache["text"], _last_status_cache["pid"]
+            
+    except Exception as e:
+        # 捕获所有异常，返回安全的错误消息
+        error_msg = f"检查状态时出错: {str(e)}"
+        return safe_encode_text(error_msg), "错误"
+
+def unload_model():
+    """
+    卸载模型，kill初始化进程并清理所有资源
+    返回卸载状态和进程ID
+    """
+    global paddleocr_vl_model, my_preprocessor, init_process, init_process_pid, init_status_queue, init_params, _last_status_cache
+    
+    try:
+        killed_pid = None
+        status_messages = []
+        
+        # 1. 终止初始化进程（如果存在且正在运行）
+        if init_process is not None:
+            if init_process.is_alive():
+                killed_pid = init_process.pid
+                try:
+                    # 先尝试优雅终止
+                    init_process.terminate()
+                    # 等待最多2秒
+                    init_process.join(timeout=2)
+                    
+                    # 如果进程仍在运行，强制kill
+                    if init_process.is_alive():
+                        init_process.kill()
+                        init_process.join(timeout=1)
+                        status_messages.append(f"⚠️ 进程 {killed_pid} 已被强制终止")
+                    else:
+                        status_messages.append(f"✅ 进程 {killed_pid} 已终止")
+                except Exception as e:
+                    status_messages.append(f"⚠️ 终止进程 {killed_pid} 时出错: {str(e)}")
+                    # 尝试强制kill
+                    try:
+                        if init_process.is_alive():
+                            init_process.kill()
+                            init_process.join(timeout=1)
+                            status_messages.append(f"✅ 进程 {killed_pid} 已被强制终止")
+                    except:
+                        pass
+            else:
+                killed_pid = init_process_pid
+                status_messages.append(f"ℹ️ 进程 {killed_pid} 已结束")
+        
+        # 2. 清理模型对象
+        if paddleocr_vl_model is not None:
+            try:
+                # 如果模型有unload方法，调用它
+                if hasattr(paddleocr_vl_model, 'unload'):
+                    paddleocr_vl_model.unload()
+                paddleocr_vl_model = None
+                status_messages.append("✅ 模型对象已清理")
+            except Exception as e:
+                status_messages.append(f"⚠️ 清理模型对象时出错: {str(e)}")
+                paddleocr_vl_model = None
+        
+        # 3. 清理预处理器
+        if my_preprocessor is not None:
+            my_preprocessor = None
+            status_messages.append("✅ 预处理器已清理")
+        
+        # 4. 清理进程相关变量
+        init_process = None
+        if init_process_pid is not None:
+            old_pid = init_process_pid
+            init_process_pid = None
+            if killed_pid is None:
+                killed_pid = old_pid
+        else:
+            if killed_pid is None:
+                killed_pid = "无"
+        
+        # 5. 清理队列（彻底清空，避免内存泄漏）
+        if init_status_queue is not None:
+            # 清空队列，限制尝试次数避免无限循环
+            try:
+                max_attempts = 100  # 最多尝试100次
+                attempt = 0
+                while not init_status_queue.empty() and attempt < max_attempts:
+                    try:
+                        init_status_queue.get_nowait()
+                        attempt += 1
+                    except:
+                        break
+                # 确保队列被完全清空
+                try:
+                    while not init_status_queue.empty():
+                        init_status_queue.get_nowait()
+                except:
+                    pass
+            except:
+                pass
+            init_status_queue = None
+            status_messages.append("✅ 状态队列已清理")
+        
+        # 6. 清理参数
+        init_params = None
+        
+        # 7. 清理状态缓存
+        _last_status_cache = {"text": "", "pid": "", "timestamp": 0}
+        
+        # 8. 清理Gradio相关资源
+        try:
+            # 清理Gradio的内部缓存和会话状态
+            # 注意：Gradio的某些资源可能无法直接清理，但我们可以清理我们能控制的部分
+            status_messages.append("🔄 正在清理Gradio资源...")
+            
+            # 清理matplotlib的缓存
+            try:
+                plt.close('all')  # 关闭所有matplotlib图形
+                matplotlib.pyplot.ioff()  # 关闭交互模式
+                # 清理matplotlib的后端缓存
+                if hasattr(matplotlib.pyplot, 'clear'):
+                    matplotlib.pyplot.clear()
+            except:
+                pass
+            
+            # 清理PIL图像缓存
+            try:
+                # PIL图像对象会在垃圾回收时自动清理，这里只是确保没有引用
+                pass
+            except:
+                pass
+            
+            # 清理pandas缓存
+            try:
+                # pandas的缓存主要在DataFrame对象中，会在垃圾回收时清理
+                pass
+            except:
+                pass
+            
+            # 清理torch缓存（如果有）
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()  # 清空CUDA缓存
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+            except:
+                pass
+            
+            # 清理OpenVINO缓存（如果有）
+            try:
+                # OpenVINO的Core对象可能持有缓存
+                # 注意：这里不能直接清理，因为core对象可能还在使用
+                pass
+            except:
+                pass
+            
+            # 清理Python内置缓存
+            try:
+                import sys
+                # 清理模块缓存中的临时对象（谨慎使用）
+                # sys.modules 不应该被清理，但可以清理一些临时变量
+                pass
+            except:
+                pass
+            
+            status_messages.append("✅ Gradio资源清理完成")
+        except Exception as e:
+            status_messages.append(f"⚠️ 清理Gradio资源时出错: {str(e)}")
+        
+        # 9. 强制垃圾回收（多次执行，确保彻底清理）
+        import gc
+        for _ in range(3):  # 执行3次垃圾回收，确保彻底清理
+            gc.collect()
+        status_messages.append("✅ 内存已清理")
+        
+        # 生成状态消息
+        if status_messages:
+            status_text = "\n".join(status_messages)
+        else:
+            status_text = "✅ 模型已卸载（无运行中的进程）"
+        
+        status_text = f"🔄 卸载模型完成\n\n{status_text}"
+        
+        return safe_encode_text(status_text), "未启动"
+        
+    except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
+        return f"❌ 卸载模型失败: {str(e)}\n\n详细信息:\n{error_detail}", "错误"
 
 def convert_latex_format(text):
     """
@@ -919,13 +1386,26 @@ with gr.Blocks(
                 llm_int4 = gr.Checkbox(label="LLM INT4压缩", value=False, interactive=False)
                 vision_int8 = gr.Checkbox(label="Vision INT8量化", value=False, interactive=False)
                 llm_int8 = gr.Checkbox(label="LLM INT8量化", value=False, interactive=False)
-                init_btn = gr.Button("初始化模型", variant="primary")
+                with gr.Row():
+                    init_btn = gr.Button("初始化模型", variant="primary")
+                    check_status_btn = gr.Button("检查状态", variant="secondary")
+                    unload_btn = gr.Button("卸载模型", variant="stop")
             with gr.Column():
                 init_status = gr.Textbox(
                     label="初始化状态",
                     value="等待初始化...",
                     interactive=False,
-                    lines=5
+                    lines=5,
+                    max_lines=5,  # 限制最大行数，避免内容累积
+                    show_copy_button=False  # 禁用复制按钮，减少内存占用
+                )
+                process_id_display = gr.Textbox(
+                    label="进程ID",
+                    value="未启动",
+                    interactive=False,
+                    lines=1,
+                    max_lines=1,  # 限制最大行数
+                    show_copy_button=False
                 )
     
     with gr.Tab("OCR识别"):
@@ -990,6 +1470,11 @@ with gr.Blocks(
             - **设备类型**: 选择CPU或GPU（推荐GPU）
             - **Chat模板文件**: 可选，留空使用默认模板
             - **量化选项**: 根据需要选择是否启用量化以提升性能
+            - **自动状态更新**: 系统每2秒自动检查并更新初始化状态，无需手动点击"检查状态"按钮
+            - **进程管理**: 
+              - 点击"初始化模型"启动独立进程进行模型验证
+              - 点击"检查状态"手动查看当前状态
+              - 点击"卸载模型"终止进程并清理所有资源
             
             ### 2. OCR识别
             - **上传图片（方式1）**: 支持上传或粘贴图片
@@ -1032,13 +1517,80 @@ with gr.Blocks(
     init_btn.click(
         fn=initialize_model,
         inputs=[ov_model_path_input, device_type, llm_int4, vision_int8, llm_int8, template_path_input],
-        outputs=init_status
+        outputs=[init_status, process_id_display]
+    )
+    
+    check_status_btn.click(
+        fn=check_init_status,
+        inputs=[],
+        outputs=[init_status, process_id_display]
+    )
+    
+    # 创建卸载模型的包装函数，同时清空所有输出组件
+    def unload_model_and_clear_all():
+        """卸载模型并清空所有Gradio输出组件和资源"""
+        # 卸载模型
+        status_text, pid_text = unload_model()
+        
+        # 清空OCR识别结果
+        # 返回所有需要清空的值
+        return (
+            status_text,  # init_status
+            pid_text,     # process_id_display
+            "等待识别结果...",  # markdown_output
+            "",           # result_output
+            ""            # raw_result
+        )
+    
+    unload_btn.click(
+        fn=unload_model_and_clear_all,
+        inputs=[],
+        outputs=[init_status, process_id_display, markdown_output, result_output, raw_result]
     )
     
     recognize_btn.click(
         fn=process_ocr,
         inputs=[image_input, image_url_or_path, task_type, max_tokens, custom_prompt],
         outputs=[result_output, raw_result, markdown_output]
+    )
+    
+    # 添加定时器实现自动轮询状态更新
+    # 优化：只在有进程运行时才更新，减少不必要的内存占用
+    _last_gc_time = time.time()  # 记录上次垃圾回收时间
+    
+    def safe_check_status():
+        """安全的状态检查包装函数，添加异常处理和内存优化"""
+        global init_process, _last_gc_time
+        try:
+            # 如果没有进程，减少更新频率（每10秒更新一次）
+            if init_process is None:
+                # 检查缓存时间，避免频繁更新
+                cache_age = time.time() - _last_status_cache.get("timestamp", 0)
+                if cache_age < 10:
+                    # 返回缓存值，不创建新对象
+                    return _last_status_cache.get("text", "等待初始化..."), _last_status_cache.get("pid", "未启动")
+            
+            result = check_init_status()
+            
+            # 定期清理内存（每30秒清理一次）
+            current_time = time.time()
+            if current_time - _last_gc_time > 30:
+                import gc
+                gc.collect()
+                _last_gc_time = current_time
+            
+            return result
+        except Exception as e:
+            # 如果检查失败，返回安全的错误消息
+            error_msg = f"状态检查出错: {str(e)}"
+            return safe_encode_text(error_msg), "错误"
+    
+    # 使用较长的间隔（5秒），减少频率，降低内存占用
+    status_timer = gr.Timer(value=5.0, active=True)
+    status_timer.tick(
+        fn=safe_check_status,
+        inputs=[],
+        outputs=[init_status, process_id_display]
     )
 
 if __name__ == "__main__":
