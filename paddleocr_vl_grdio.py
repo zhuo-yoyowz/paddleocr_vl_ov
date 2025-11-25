@@ -11,6 +11,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 import os
 import re
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端
+import io
+import base64
 
 # 在导入后立即设置环境变量，避免Gradio初始化时的网络请求
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
@@ -137,12 +143,134 @@ def initialize_model(ov_model_path="./ov_paddleocr_vl_model",
     except Exception as e:
         return f"❌ 模型初始化失败: {str(e)}"
 
+def convert_latex_format(text):
+    """
+    将LaTeX格式转换为Gradio Markdown可识别的格式
+    - \[...\] -> $$...$$
+    - \(...\) -> $...$
+    支持多行公式
+    """
+    if not text:
+        return text
+    
+    # 将 \[...\] 转换为 $$...$$
+    # 使用非贪婪匹配，处理多行公式
+    # 先处理 \[，再处理 \]
+    text = re.sub(r'\\\[', '$$', text)
+    text = re.sub(r'\\\]', '$$', text)
+    
+    # 将 \(...\) 转换为 $...$
+    text = re.sub(r'\\\(', '$', text)
+    text = re.sub(r'\\\)', '$', text)
+    
+    # 修复可能出现的 $$ $$ 中间有换行的情况
+    # 将 $$...\n...$$ 中的换行替换为空格
+    def fix_formula_newlines(match):
+        formula = match.group(1)
+        # 移除换行，保留空格
+        formula = re.sub(r'\n+', ' ', formula)
+        formula = re.sub(r'\s+', ' ', formula)
+        return f'$${formula.strip()}$$'
+    
+    # 匹配 $$...$$ 之间的内容（包括换行）
+    text = re.sub(r'\$\$(.*?)\$\$', fix_formula_newlines, text, flags=re.DOTALL)
+    
+    return text
+
+def detect_and_format_latex(text):
+    """
+    检测文本中的LaTeX公式并格式化
+    支持检测常见的数学公式模式
+    """
+    if not text:
+        return text, False
+    
+    # 首先检查是否已经包含LaTeX格式标记
+    has_latex_markers = bool(re.search(r'\\\[|\\\]|\\\(|\\\)|\$\$|\$[^$]+\$', text))
+    
+    # LaTeX公式的常见模式
+    latex_patterns = [
+        r'[a-zA-Z]\([^)]*\)\s*=\s*[0-9]+\*?[a-zA-Z0-9\^+\-*/\s]+',  # f(x)=2x^2+2x+3
+        r'[a-zA-Z]\([^)]*\)\s*=\s*[a-zA-Z0-9\^+\-*/\s]+',  # f(a)=2a^2+2a+3
+        r'\\frac\{[^}]+\}\{[^}]+\}',  # 分数
+        r'\\sqrt\{[^}]+\}',  # 根号
+        r'\\sum_\{[^}]+\}\^\{[^}]+\}',  # 求和
+        r'\\int_\{[^}]+\}\^\{[^}]+\}',  # 积分
+        r'[a-zA-Z]\^\{[0-9]+\}',  # 上标 x^{2}
+        r'[a-zA-Z]_\{[0-9]+\}',  # 下标 x_{i}
+        r'\\cdot',  # 点乘
+        r'\\quad',  # 空格
+    ]
+    
+    has_latex = has_latex_markers
+    if not has_latex:
+        for pattern in latex_patterns:
+            if re.search(pattern, text):
+                has_latex = True
+                break
+    
+    # 转换LaTeX格式
+    if has_latex:
+        text = convert_latex_format(text)
+    
+    return text, has_latex
+
+def needs_table_header(first_cells, has_data_rows=True):
+    """
+    通用检测：判断表格第一行是否需要添加表头
+    
+    Args:
+        first_cells: 第一行的单元格列表
+        has_data_rows: 是否有数据行（至少2行）
+    
+    Returns:
+        bool: 如果需要添加表头返回True，否则返回False
+    """
+    if len(first_cells) < 2 or not has_data_rows:
+        return False
+    
+    # 数据行的特征模式
+    data_like_patterns = [
+        r'^\d{4}$',  # 4位年份
+        r'^[12]Q\d{2}$',  # 季度格式 1Q22, 2Q23
+        r'^\d+\.?\d*%?$',  # 数字或百分比
+        r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}$',  # 日期格式
+        r'^[A-Z]{2,}\d+$',  # 代码格式如 ABC123
+        r'^\d+$',  # 纯数字
+    ]
+    
+    # 表头关键词（如果包含这些词，认为是表头）
+    header_keywords = ['项目', '类别', '名称', '类型', 'type', 'category', 
+                      'item', 'name', 'label', '标题', 'header', '列', 'column']
+    
+    # 检查第一行是否包含表头关键词
+    has_header_keyword = any(
+        keyword.lower() in cell.lower() 
+        for cell in first_cells 
+        for keyword in header_keywords
+    )
+    
+    # 如果包含表头关键词，不需要添加表头
+    if has_header_keyword:
+        return False
+    
+    # 统计第一行中像数据的单元格数量
+    data_like_count = 0
+    for cell in first_cells:
+        # 检查是否匹配数据模式
+        if any(re.match(pattern, cell) for pattern in data_like_patterns):
+            data_like_count += 1
+    
+    # 如果80%以上像数据，则需要添加表头
+    return data_like_count >= len(first_cells) * 0.8
+
 def format_ocr_result(text):
     """
     格式化OCR识别结果，处理特殊标记
     支持格式：
     - <fcel> 表格单元格标记（格式：<fcel>内容<fcel>）
     - <nl> 换行标记
+    - LaTeX数学公式（自动检测并格式化）
     
     注意：格式是 <fcel>内容<fcel>，即开始和结束都是 <fcel>
     只有检测到表格格式时才转换为Markdown表格，否则只清理标记
@@ -152,6 +280,9 @@ def format_ocr_result(text):
     
     # 先替换换行标记
     text = text.replace('<nl>', '\n')
+    
+    # 检测LaTeX公式
+    text, has_latex = detect_and_format_latex(text)
     
     # 检测是否是表格格式（包含多个<fcel>标记）
     # 需要检查是否有多个<fcel>标记，且至少有一行包含多个单元格
@@ -233,20 +364,183 @@ def format_ocr_result(text):
     text = text.replace('</fcel>', '')
     # <nl>已经在开头替换为\n了，这里不需要再处理
     
-    # 清理多余的空行（保留合理的空行）
+    # 检测并修复不完整的Markdown表格格式
+    # 例如: "| 2017 | 2018 | ..." 或 "2017 | 2018 | ..." (缺少开头|)
     lines = text.split('\n')
     cleaned_lines = []
     prev_empty = False
-    for line in lines:
-        line = line.strip()
-        if line:
-            cleaned_lines.append(line)
-            prev_empty = False
-        elif not prev_empty:
-            cleaned_lines.append('')
-            prev_empty = True
     
-    return '\n'.join(cleaned_lines)
+    # 检测是否是表格格式（包含多个|符号）
+    pipe_count = sum(line.count('|') for line in lines if line.strip())
+    if pipe_count >= 5:  # 至少5个|符号，可能是表格
+        # 尝试修复表格格式
+        table_lines = []
+        for line in lines:
+            line_stripped = line.strip()
+            if not line_stripped:
+                if not prev_empty:
+                    cleaned_lines.append('')
+                    prev_empty = True
+                continue
+            
+            # 如果包含|符号，可能是表格行
+            if '|' in line_stripped:
+                # 如果行首没有|，添加一个
+                if not line_stripped.startswith('|'):
+                    line_stripped = '| ' + line_stripped
+                # 如果行尾没有|，添加一个
+                if not line_stripped.endswith('|'):
+                    line_stripped = line_stripped + ' |'
+                table_lines.append(line_stripped)
+                prev_empty = False
+            else:
+                # 如果不是表格行，先处理之前收集的表格行
+                if table_lines:
+                    # 通用检测：判断第一行是否需要添加表头
+                    first_line = table_lines[0]
+                    first_cells = [c.strip() for c in first_line.split('|') if c.strip()]
+                    needs_header = needs_table_header(first_cells, has_data_rows=len(table_lines) > 1)
+                    
+                    if needs_header:
+                        # 第一行是数据行，需要添加表头
+                        # 添加"项目"作为第一列的表头
+                        header = "| 项目 | " + " | ".join(first_cells) + " |"
+                        separator = "| " + " | ".join(["---"] * (len(first_cells) + 1)) + " |"
+                        cleaned_lines.append(header)
+                        cleaned_lines.append(separator)
+                        # 添加数据行
+                        for data_line in table_lines[1:]:
+                            cleaned_lines.append(data_line)
+                    else:
+                        # 标准表格格式，直接添加
+                        for table_line in table_lines:
+                            cleaned_lines.append(table_line)
+                        # 如果第一行不是分隔行，添加分隔行
+                        if cleaned_lines and '---' not in cleaned_lines[-1]:
+                            first_table_line = table_lines[0]
+                            num_cols = first_table_line.count('|') - 1
+                            if num_cols > 0:
+                                separator = "| " + " | ".join(["---"] * num_cols) + " |"
+                                # 在表头后插入分隔行
+                                cleaned_lines.insert(-len(table_lines) + 1, separator)
+                    
+                    table_lines = []
+                
+                cleaned_lines.append(line_stripped)
+                prev_empty = False
+        
+        # 处理最后的表格行
+        if table_lines:
+            # 通用检测：判断第一行是否需要添加表头
+            first_line = table_lines[0]
+            first_cells = [c.strip() for c in first_line.split('|') if c.strip()]
+            needs_header = needs_table_header(first_cells, has_data_rows=len(table_lines) > 1)
+            
+            if needs_header:
+                header = "| 项目 | " + " | ".join(first_cells) + " |"
+                separator = "| " + " | ".join(["---"] * (len(first_cells) + 1)) + " |"
+                cleaned_lines.append(header)
+                cleaned_lines.append(separator)
+                for data_line in table_lines[1:]:
+                    cleaned_lines.append(data_line)
+            else:
+                for table_line in table_lines:
+                    cleaned_lines.append(table_line)
+                if cleaned_lines and '---' not in cleaned_lines[-1]:
+                    first_table_line = table_lines[0]
+                    num_cols = first_table_line.count('|') - 1
+                    if num_cols > 0:
+                        separator = "| " + " | ".join(["---"] * num_cols) + " |"
+                        cleaned_lines.insert(-len(table_lines) + 1, separator)
+    else:
+        # 不是表格格式，正常处理
+        for line in lines:
+            line = line.strip()
+            if line:
+                cleaned_lines.append(line)
+                prev_empty = False
+            elif not prev_empty:
+                cleaned_lines.append('')
+                prev_empty = True
+    
+    result = '\n'.join(cleaned_lines)
+    
+    # 如果检测到LaTeX公式，尝试格式化
+    if has_latex:
+        # 首先处理已经存在的 $$...$$ 格式，合并换行
+        def fix_multiline_formula(match):
+            formula = match.group(1)
+            # 移除多余的换行和空白，但保留必要的空格
+            formula = re.sub(r'\n+', ' ', formula)
+            formula = re.sub(r'\s+', ' ', formula)
+            formula = formula.strip()
+            return f'$${formula}$$'
+        
+        # 修复被换行分割的公式：合并 $$...$$ 之间的换行
+        result = re.sub(r'\$\$(.*?)\$\$', fix_multiline_formula, result, flags=re.DOTALL)
+        
+        # 尝试将常见的数学表达式转换为LaTeX格式
+        # 例如: f(x)=2x^2+2x+3 -> f(x)=2x^{2}+2x+3
+        result = re.sub(r'(\w+)\^(\d+)', r'\1^{\2}', result)  # x^2 -> x^{2}
+        result = re.sub(r'(\w+)_(\d+)', r'\1_{\2}', result)  # x_2 -> x_{2}
+        
+        # 如果公式还没有被 $$ 包围，尝试识别并添加
+        if '$$' not in result:
+            # 尝试识别公式片段并包围
+            lines = result.split('\n')
+            formatted_lines = []
+            formula_buffer = []
+            collecting_formula = False
+            
+            for line in lines:
+                line_stripped = line.strip()
+                
+                # 检测是否是公式的一部分（包含数学符号或函数表达式）
+                is_formula_line = bool(
+                    re.search(r'[a-zA-Z]\([^)]+\)\s*=', line_stripped) or  # f(x)=...
+                    re.search(r'[a-zA-Z]\([^)]+\)\s*=\s*[0-9]', line_stripped) or  # f(3)=27
+                    ('^{' in line_stripped) or  # 上标
+                    ('\\cdot' in line_stripped) or  # 点乘
+                    ('\\quad' in line_stripped) or  # 空格
+                    (re.search(r'[a-zA-Z]\^\{[0-9]+\}', line_stripped))  # x^{2}
+                )
+                
+                # 检测是否是单个字符（可能是被分割的公式片段）
+                is_single_char = len(line_stripped) == 1 and line_stripped.isalnum()
+                
+                if is_formula_line or (is_single_char and collecting_formula):
+                    if not collecting_formula:
+                        collecting_formula = True
+                        formula_buffer = [line_stripped]
+                    else:
+                        formula_buffer.append(line_stripped)
+                else:
+                    if collecting_formula and formula_buffer:
+                        # 结束公式，合并并添加 $$ 包围
+                        formula_text = ' '.join(formula_buffer)
+                        # 清理公式文本
+                        formula_text = re.sub(r'\s+', ' ', formula_text).strip()
+                        if formula_text:
+                            formatted_lines.append(f'$${formula_text}$$')
+                        formula_buffer = []
+                        collecting_formula = False
+                    
+                    if line_stripped:  # 非空行
+                        formatted_lines.append(line)
+                    elif not formatted_lines or formatted_lines[-1]:  # 保留空行（如果前一行不为空）
+                        formatted_lines.append('')
+            
+            # 处理最后的公式
+            if collecting_formula and formula_buffer:
+                formula_text = ' '.join(formula_buffer)
+                formula_text = re.sub(r'\s+', ' ', formula_text).strip()
+                if formula_text:
+                    formatted_lines.append(f'$${formula_text}$$')
+            
+            if formatted_lines:
+                result = '\n'.join(formatted_lines)
+    
+    return result
 
 def load_image_from_source(image_source):
     """从不同来源加载图片：PIL Image对象、本地路径或URL"""
@@ -282,6 +576,138 @@ def load_image_from_source(image_source):
                 raise Exception(f"无法从本地路径加载图片: {str(e)}")
     
     return image_source
+
+def parse_table_data(text):
+    """
+    解析表格数据，支持Markdown表格格式
+    返回pandas DataFrame
+    """
+    try:
+        # 尝试解析Markdown表格
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        
+        if not lines:
+            return None
+        
+        # 找到表头行（包含 | 的第一行，且不是分隔行）
+        header_line = None
+        data_start_idx = 0
+        
+        for i, line in enumerate(lines):
+            if '|' in line and '---' not in line and not line.startswith('---'):
+                if header_line is None:
+                    header_line = line
+                    data_start_idx = i + 1
+                    break
+        
+        if header_line is None:
+            return None
+        
+        # 解析表头
+        headers = [h.strip() for h in header_line.split('|') if h.strip()]
+        
+        if not headers:
+            return None
+        
+        # 解析数据行（跳过分隔行）
+        data_rows = []
+        for line in lines[data_start_idx:]:
+            if '|' in line and '---' not in line and not line.startswith('---'):
+                row_data = [cell.strip() for cell in line.split('|') if cell.strip()]
+                # 允许数据行列数少于表头（补齐空值）
+                while len(row_data) < len(headers):
+                    row_data.append('')
+                if len(row_data) >= len(headers):
+                    data_rows.append(row_data[:len(headers)])
+        
+        if not data_rows:
+            return None
+        
+        # 创建DataFrame
+        df = pd.DataFrame(data_rows, columns=headers)
+        return df
+    except Exception as e:
+        print(f"解析表格数据失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def create_chart_from_table(text, chart_type="line"):
+    """
+    从表格数据创建图表
+    chart_type: "line", "bar", "both"
+    返回base64编码的图片
+    """
+    try:
+        df = parse_table_data(text)
+        if df is None or df.empty:
+            return None
+        
+        # 设置中文字体
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+        
+        # 获取第一列作为x轴（通常是时间或类别）
+        x_col = df.columns[0]
+        x_data = df[x_col].tolist()
+        
+        # 获取数值列
+        numeric_cols = []
+        for col in df.columns[1:]:
+            try:
+                # 尝试转换为数值（处理百分比等格式）
+                values = []
+                for val in df[col]:
+                    val_str = str(val).replace('%', '').strip()
+                    try:
+                        values.append(float(val_str))
+                    except:
+                        values.append(0)
+                df[col + '_numeric'] = values
+                numeric_cols.append(col)
+            except:
+                continue
+        
+        if not numeric_cols:
+            return None
+        
+        # 创建图表
+        fig, axes = plt.subplots(len(numeric_cols), 1, figsize=(12, 6 * len(numeric_cols)))
+        if len(numeric_cols) == 1:
+            axes = [axes]
+        
+        for idx, col in enumerate(numeric_cols):
+            ax = axes[idx]
+            y_data = df[col + '_numeric'].tolist()
+            
+            if chart_type in ["line", "both"]:
+                ax.plot(x_data, y_data, marker='o', linewidth=2, markersize=6, label=col)
+            
+            if chart_type in ["bar", "both"]:
+                ax.bar(x_data, y_data, alpha=0.6, label=col)
+            
+            ax.set_xlabel(x_col, fontsize=10)
+            ax.set_ylabel(col, fontsize=10)
+            ax.set_title(f'{col} 趋势图', fontsize=12, fontweight='bold')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(axis='x', rotation=45)
+        
+        plt.tight_layout()
+        
+        # 转换为base64
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        buf.seek(0)
+        img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+        plt.close()
+        
+        return f"data:image/png;base64,{img_base64}"
+    except Exception as e:
+        print(f"创建图表失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 def process_ocr(image, image_url_or_path, task_type, max_new_tokens, custom_prompt):
     """处理OCR识别"""
@@ -385,13 +811,25 @@ def process_ocr(image, image_url_or_path, task_type, max_new_tokens, custom_prom
         )
         elapsed_time = time.perf_counter() - start_time
         
-        # 格式化结果（处理特殊标记）
+        # 格式化结果（处理特殊标记，包括LaTeX格式转换）
         formatted_response = format_ocr_result(response)
         
-        # 判断是否是表格格式（包含Markdown表格）
-        is_table = formatted_response.strip().startswith('|') and '---' in formatted_response
+        # 检测是否包含LaTeX公式（在格式化后再次检测，因为format_ocr_result已经处理了格式转换）
+        formatted_for_detect, has_latex = detect_and_format_latex(formatted_response)
+        if has_latex:
+            formatted_response = formatted_for_detect
         
- # 格式化结果文本
+        # 判断是否是表格格式（包含Markdown表格）
+        # 检测包含多个|符号的行，可能是表格
+        lines = [line.strip() for line in formatted_response.split('\n') if line.strip()]
+        pipe_count = sum(line.count('|') for line in lines)
+        has_separator = '---' in formatted_response
+        
+        # 如果包含多个|符号（至少5个），可能是表格
+        is_table = (formatted_response.strip().startswith('|') and has_separator) or \
+                   (pipe_count >= 5 and any('|' in line for line in lines[:3]))  # 前3行中有包含|的行
+        
+        # 格式化结果文本
         result_text = f"""📄 OCR识别结果:
 {formatted_response}
 
@@ -400,13 +838,25 @@ def process_ocr(image, image_url_or_path, task_type, max_new_tokens, custom_prom
         
         # 准备Markdown可视化内容
         if is_table:
-            # 只有表格才转换为Markdown并可视化
+            # 表格可视化（只显示表格，不显示图表）
             markdown_content = f"""## 📊 表格可视化
 
 {formatted_response}
 
 ---
 *执行时间: {elapsed_time:.3f} 秒*
+"""
+        elif has_latex:
+            # 包含LaTeX公式的情况，直接使用格式化后的结果
+            # formatted_response 已经包含了正确的 $$...$$ 格式
+            markdown_content = f"""## 📐 数学公式识别结果
+
+{formatted_response}
+
+---
+*执行时间: {elapsed_time:.3f} 秒*
+
+**提示**: LaTeX公式已自动格式化，如果公式未正确渲染，请检查公式格式是否正确。
 """
         else:
             # 非表格情况，直接显示原始文本（不进行Markdown格式化）
@@ -528,7 +978,7 @@ with gr.Blocks(
                     lines=8,
                     interactive=True
                 )
-                gr.Markdown("**提示**: 格式化结果会自动将表格标记转换为Markdown表格格式，并在上方可视化显示")
+                gr.Markdown("**提示**: 格式化结果会自动将表格标记转换为Markdown表格格式，并在上方可视化显示。系统会自动识别表格和LaTeX公式并渲染。")
     
     with gr.Tab("使用说明"):
         gr.Markdown(
@@ -551,7 +1001,7 @@ with gr.Blocks(
             - **任务类型**: 
               - `ocr`: 普通文字识别
               - `table`: 表格识别
-              - `formula`: 公式识别
+              - `formula`: 公式识别（支持LaTeX格式）
               - `chart`: 图表识别
             - **自定义提示词**: 可以输入自定义的提示词
             - **最大token数**: 控制生成文本的最大长度
@@ -559,12 +1009,22 @@ with gr.Blocks(
             ### 3. 结果查看
             - **识别结果**: 显示完整的识别结果和执行时间
             - **原始结果**: 仅显示识别出的文本内容，可以复制
+            - **Markdown可视化**: 自动识别表格和LaTeX公式并渲染
+            
+            ### 4. 自动可视化功能
+            - **LaTeX公式**: 系统会自动检测识别结果中的数学公式并渲染
+              - 支持块级公式（`$$...$$`）和行内公式（`$...$`）
+              - 自动转换 `\[...\]` 格式为 `$$...$$` 格式
+            - **表格**: 系统会自动识别表格数据并格式化为Markdown表格显示
+              - 自动识别表格格式并转换为Markdown表格
+              - 支持年份表格等特殊格式的自动识别和格式化
             
             ## ⚠️ 注意事项
             - 首次使用需要先初始化模型
             - 模型初始化可能需要一些时间
             - 识别时间取决于图片大小和模型配置
             - 本版本使用render_jinja_template和PaddleOCRVLImageProcessor
+            - LaTeX公式识别需要模型输出包含正确的数学表达式格式
             """
         )
     
@@ -593,6 +1053,8 @@ if __name__ == "__main__":
     os.environ["no_proxy"] = "127.0.0.1,localhost"
     # 禁用启动事件检查
     os.environ["GRADIO_SKIP_STARTUP_EVENTS"] = "1"
+    # 增加响应大小限制，避免Content-Length错误
+    os.environ["GRADIO_MAX_CONTENT_LENGTH"] = "1048576000"  # 100MB
     
     def find_free_port(start_port=7860, max_attempts=10):
         """查找可用端口"""
