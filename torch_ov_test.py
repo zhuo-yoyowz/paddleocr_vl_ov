@@ -70,7 +70,7 @@ def main(pretrained_model_path, ov_model_path, image_path=image_path, task=task,
     total_time = generate_time + decode_time
 
     print("\n" + "="*60)
-    print("📄 Transformers OCR 识别结果:")
+    print(f"📄 {device} Transformers {task} 识别结果:")
     print("="*60)
     print(outputs)
     print("="*60)
@@ -163,7 +163,7 @@ def main(pretrained_model_path, ov_model_path, image_path=image_path, task=task,
     chat_time = time.perf_counter() - start_time
 
     print("\n" + "="*60)
-    print("📄 openVINO OCR 识别结果:")
+    print(f"📄 {ov_device} openVINO {task} 识别结果:")
     print("="*60)
     print(response)
     print("="*60)

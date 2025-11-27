@@ -56,25 +56,36 @@ Sample comparison output:
 
 ```text
 ============================================================
-📄 Transformers OCR 识别结果:
+🔄 正在加载Transformers模型...
 ============================================================
-User: OCR:
-Assistant: App | AI financial report analysis | AI homework grading | AI contract & bill review | Intelligent document processing | Certificate information extraction | More...
-Model Zoo | OCR Series | Doc Parsing Series | Doc Understanding Series | PP-DocBee2 | Table Shibie Seal Shibie Formula Shibie Chart Shibie ... ... | More
-Toolkit | PP-OCRv3 | PaddleOCR-VL | PP-DocTranslation | PP-DocTranslation |   |
-  | PP-OCRv4 | PP-StructureV3 | PP-ChatOCRv4 | PP-ChatOCRv4 |   |
-  | PP-OCRv5 | PP-StructureV3 | PP-ChatOCRv4 | PP-ChatOCRv4 |   |
-  | Train | Inference | High Performance Serving | MCP Server |   |
-  | by just 1 command | by 3 lines code | by just 1 command | Called by LLMs |   |
-Frame work | PaddlePaddle 3.0+ | Intel | KUNLUNXIN | Ascend |   |
-Hardware | NVIDIA | Intel | KUNLUNXIN | Ascend |   |
+Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+
+============================================================
+📄 cpu Transformers chart 识别结果:
+============================================================
+User: Chart Recognition:
+Assistant: Quarter | mom change | existing home take rate
+1Q22 | -0.04% | 1.64%
+2Q22 | -0.2% | 1.41%
+3Q22 | 0.2% | 1.59%
+4Q22 | -0.1% | 1.5%
+1Q23 | -0.1% | 1.38%
+2Q23 | 0.0% | 1.41%
+3Q23 | 0.0% | 1.44%
+4Q23 | -0.1% | 1.29%
+1Q24 | -0.03% | 1.26%
+2Q24 | 0.02% | 1.29%
+3Q24 | 0.0% | 1.3%
+4Q24 | -0.1% | 1.2%
+1Q25 | -0.01% | 1.18%
 ============================================================
 
 ⏱️  执行时间统计:
-   - 生成时间 (generate): 47.393 秒 (47392.69 毫秒)
-   - 解码时间 (decode):   0.005 秒 (4.62 毫秒)
-   - 总时间:              47.397 秒 (47397.31 毫秒)
+   - 生成时间 (generate): 39.446 秒 (39445.81 毫秒)
+   - 解码时间 (decode):   0.000 秒 (0.40 毫秒)
+   - 总时间:              39.446 秒 (39446.20 毫秒)
 ============================================================
+
 
 ============================================================
 🔄 正在加载OpenVINO模型...
@@ -82,22 +93,29 @@ Hardware | NVIDIA | Intel | KUNLUNXIN | Ascend |   |
 OpenVINO version 
  2026.0.0-20478-59bb607be25
 
+
+
 ============================================================
-📄 openVINO OCR 识别结果:
+📄 GPU openVINO chart 识别结果:
 ============================================================
-App | AI financial report analysis | AI homework grading | AI contract & bill review | Intelligent document processing | Certificate information extraction | More...       
-Model Zoo | OCR Series | Doc Parsing Series | Doc Understanding Series | PP-DocBee2 | Table Shibie Seal Shibie Formula Shibie Chart Shibie ... ... | More
-Toolkit | PP-OCRv3 | PaddleOCR-VL | PP-DocTranslation | PP-DocTranslation |   |
-  | PP-OCRv4 | PP-StructureV3 | PP-ChatOCRv4 | PP-ChatOCRv4 |   |
-  | PP-OCRv5 | PP-StructureV3 | PP-ChatOCRv4 | PP-ChatOCRv4 |   |
-  | Train | Inference | High Performance Serving | MCP Server |   |
-  | by just 1 command | by 3 lines code | by just 1 command | Called by LLMs |   |
-Frame work | PaddlePaddle 3.0+ | Intel | KUNLUNXIN | Ascend |   |
-Hardware | NVIDIA | Intel | KUNLUNXIN | Ascend |   |
+Quarter | mom change | existing home take rate
+1Q22 | -0.04% | 1.64%
+2Q22 | -0.2% | 1.41%
+3Q22 | 0.2% | 1.59%
+4Q22 | -0.1% | 1.5%
+1Q23 | -0.1% | 1.38%
+2Q23 | 0.0% | 1.41%
+3Q23 | 0.0% | 1.44%
+4Q23 | -0.1% | 1.29%
+1Q24 | -0.03% | 1.26%
+2Q24 | 0.02% | 1.29%
+3Q24 | 0.0% | 1.3%
+4Q24 | -0.1% | 1.2%
+1Q25 | -0.01% | 1.18%
 ============================================================
 
 ⏱️  执行时间统计:
-   - Chat 方法执行时间: 9.471 秒 (9471.47 毫秒)
+   - Chat 方法执行时间: 5.684 秒 (5684.29 毫秒)
 ============================================================
 ```
 
