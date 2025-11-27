@@ -27,7 +27,7 @@ This repository demonstrates how to convert the [PaddleOCR-VL](https://huggingfa
 
 > **📅 Last Updated: 2025/11/25**
 
-1. **Platform Support**: Currently only verified on Windows
+1. **OS Support**: Currently only verified on Windows
 2. **INT4 Compression**: Not recommended - may produce incorrect results
 3. **Device Support**: 
    - ✅ Supported: GPU and CPU
@@ -41,6 +41,7 @@ This repository demonstrates how to convert the [PaddleOCR-VL](https://huggingfa
 conda create -n paddleocr_vl_ov python=3.12
 conda activate paddleocr_vl_ov
 pip install -r requirements.txt
+pip install --pre openvino==2025.4.0rc3 openvino-tokenizers==2025.4.0.0rc3 openvino-genai==2025.4.0.0rc3 --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly
 ```
 
 > **Note**: Replace the Python version above if needed. The `requirements.txt` shipped in this repo already pins the versions verified for both Torch and OpenVINO pipelines.
