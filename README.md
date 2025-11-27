@@ -10,6 +10,7 @@ This repo demonstrates how to convert the [PaddleOCR-VL](https://huggingface.co/
 ### 2025/11/25
 1. Paddleocr-VL model supports using openvino to accelerate the inference process. Currently only verified on windows.
 2. LLM testing shows that enabling INT4 compression is not recommended—it tends to produce incorrect results.
+3. **Device Support**: Currently, only GPU and CPU devices are supported. NPU execution is not supported and will result in runtime errors. 
 
 ## Running Guide
 
