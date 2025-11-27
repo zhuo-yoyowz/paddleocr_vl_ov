@@ -25,22 +25,12 @@ PROMPTS = {
 chat_template = '{%- if not add_generation_prompt is defined -%}\n    {%- set add_generation_prompt = true -%}\n{%- endif -%}\n{%- if not cls_token is defined -%}\n    {%- set cls_token = "<|begin_of_sentence|>" -%}\n{%- endif -%}\n{%- if not eos_token is defined -%}\n    {%- set eos_token = "</s>" -%}\n{%- endif -%}\n{%- if not image_token is defined -%}\n    {%- set image_token = "<|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>" -%}\n{%- endif -%}\n{{- cls_token -}}\n{%- for message in messages -%}\n    {%- if message["role"] == "user" -%}\n        {{- "User: " -}}\n        {%- for content in message["content"] -%}\n            {%- if content["type"] == "image" -%}\n                {{ image_token }}\n            {%- endif -%}\n        {%- endfor -%}\n        {%- for content in message["content"] -%}\n            {%- if content["type"] == "text" -%}\n                {{ content["text"] }}\n            {%- endif -%}\n        {%- endfor -%}\n        {{ "\\n" -}}\n    {%- elif message["role"] == "assistant" -%}\n        {{- "Assistant: " -}}\n        {%- for content in message["content"] -%}\n            {%- if content["type"] == "text" -%}\n                {{ content["text"] }}\n            {%- endif -%}\n        {%- endfor -%}\n        {{ eos_token -}}\n    {%- elif message["role"] == "system" -%}\n        {%- for content in message["content"] -%}\n            {%- if content["type"] == "text" -%}\n                {{ content["text"] + "\\n" }}\n            {%- endif -%}\n        {%- endfor -%}\n    {%- endif -%}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{- "Assistant: " -}}\n{%- endif -%}\n'
 
 
-def main(model_path, ov_model_path, image_path=image_path, task=task, device=DEVICE, ov_device="GPU"):
+def main(pretrained_model_path, ov_model_path, image_path=image_path, task=task, device=DEVICE, ov_device="GPU"):
     """主函数：执行Transformers和OpenVINO模型的OCR识别对比测试"""
     
     # 加载和预处理图像
     image = Image.open(image_path).convert("RGB")
     image = image.resize((1200, 800), Image.Resampling.LANCZOS)
-
-    # ========== Transformers模型测试 ==========
-    print("\n" + "="*60)
-    print("🔄 正在加载Transformers模型...")
-    print("="*60)
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
-    ).to(device).eval()
-    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
     messages = [
         {"role": "user",         
@@ -50,6 +40,16 @@ def main(model_path, ov_model_path, image_path=image_path, task=task, device=DEV
             ]
         }
     ]
+
+    # ========== Transformers模型测试 ==========
+    print("\n" + "="*60)
+    print("🔄 正在加载Transformers模型...")
+    print("="*60)
+    
+    model = AutoModelForCausalLM.from_pretrained(
+        pretrained_model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
+    ).to(device).eval()
+    processor = AutoProcessor.from_pretrained(pretrained_model_path, trust_remote_code=True)
 
     inputs = processor.apply_chat_template(
         messages, 
